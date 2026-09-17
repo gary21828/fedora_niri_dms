@@ -45,11 +45,16 @@
 #   niri config includes:  https://niri-wm.github.io/niri/Configuration:-Include.html
 #
 # Notes on this revision (rev4)
-#   - greetd starts `dms-greeter --command niri-session -C /etc/greetd/niri.kdl`.
-#     Raw `niri` skips systemd/D-Bus import: black greeter and inactive niri.service.
-#   - After `dms-greeter enable`, the script re-reads config.toml and rewrites
-#     it if the command is not niri-session. A failed --command flag must not
-#     silently fall back to `--command niri`.
+#   - Two different commands, do not mix them:
+#       greetd default_session (login UI) =
+#         dms-greeter --command niri -C /etc/greetd/niri.kdl
+#       session after password =
+#         niri-session   (from /usr/share/wayland-sessions/niri.desktop)
+#     `dms-greeter --command` only accepts compositor names (niri, hyprland,
+#     sway, …). Passing niri-session prints "unsupported compositor" and
+#     leaves a black VT1.
+#   - After `dms-greeter enable`, pin_greetd_command() rewrites config.toml
+#     unless it already has `--command niri` and `-C /etc/greetd/niri.kdl`.
 #   - Greeter host config is /etc/greetd/niri.kdl (DMS_RUN_GREETER=1).
 #   - Config includes require niri >= 25.11; older niri gets a standalone file.
 #   - Includes use `optional=true`. Duplicate binds are stripped when
@@ -410,11 +415,10 @@ configure_system() {
 
     if command -v dms-greeter >/dev/null 2>&1; then
         # Official helper writes /etc/greetd/config.toml, disables other DMs,
-        # and enables greetd. Then pin_greetd_command() re-reads that file and
-        # forces niri-session + -C /etc/greetd/niri.kdl. Bare `dms-greeter
-        # enable` often writes `--command niri`, which skips systemd import
-        # and is the black-greeter / inactive niri.service path.
-        if sudo dms-greeter enable --command niri-session >/dev/null 2>&1 \
+        # and enables greetd. --command is the GREETER compositor, which must
+        # be the name "niri". pin_greetd_command() then forces -C so the
+        # greeter seat uses /etc/greetd/niri.kdl (DMS_RUN_GREETER=1).
+        if sudo dms-greeter enable --command niri >/dev/null 2>&1 \
             || sudo dms-greeter enable >/dev/null 2>&1; then
             ok "dms-greeter enable ran"
         else
@@ -485,22 +489,23 @@ EOF
 }
 
 pin_greetd_command() {
-    # Always write the known-good greetd command. dms-greeter enable may
-    # have just set `--command niri` (no session wrapper, no -C). That is
-    # the black VT1 failure mode this revision exists to prevent.
-    local cmd='dms-greeter --command niri-session -C /etc/greetd/niri.kdl'
+    # Known-good greetd *greeter* command. --command must be the compositor
+    # name "niri". niri-session is what the user picks AFTER the password
+    # (wayland-sessions/niri.desktop), not what hosts the login UI.
+    local cmd='dms-greeter --command niri -C /etc/greetd/niri.kdl'
     local current=""
     if [[ -f /etc/greetd/config.toml ]]; then
         current=$(grep -E '^[[:space:]]*command[[:space:]]*=' /etc/greetd/config.toml | tail -n1 || true)
     fi
-    if printf '%s\n' "${current}" | grep -q 'niri-session' \
+    if printf '%s\n' "${current}" | grep -q -- '--command niri' \
+        && ! printf '%s\n' "${current}" | grep -q 'niri-session' \
         && printf '%s\n' "${current}" | grep -q '/etc/greetd/niri.kdl'; then
         ok "greetd command already pinned: ${cmd}"
         return 0
     fi
     if [[ -n ${current} ]]; then
         warn "greetd command was: ${current}"
-        warn "Rewriting to niri-session + /etc/greetd/niri.kdl"
+        warn "Rewriting to --command niri -C /etc/greetd/niri.kdl"
     fi
     write_file /tmp/greetd-config.toml <<EOF
 [terminal]
@@ -513,6 +518,17 @@ EOF
     sudo install -m 0644 /tmp/greetd-config.toml /etc/greetd/config.toml
     rm -f /tmp/greetd-config.toml
     ok "Wrote /etc/greetd/config.toml (${cmd})"
+
+    local desk=/usr/share/wayland-sessions/niri.desktop
+    if [[ -f ${desk} ]] && grep -q '^Exec=niri-session' "${desk}"; then
+        ok "After-login session is niri-session (${desk})"
+    elif [[ -f ${desk} ]]; then
+        warn "${desk} Exec= is not niri-session; pick Niri in the greeter anyway"
+        warn "TTY fallback remains: niri-session"
+    else
+        warn "No ${desk}; after password the greeter may not list a Niri session"
+        warn "TTY fallback: Ctrl+Alt+F2, then niri-session"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1248,8 +1264,9 @@ print_summary() {
  Files
    ~/.config/niri/config.kdl
    ~/.config/niri/dms/*.kdl     (from \`dms setup\`)
-   /etc/greetd/config.toml      (dms-greeter --command niri-session)
+   /etc/greetd/config.toml      (dms-greeter --command niri -C …/niri.kdl)
    /etc/greetd/niri.kdl         (greeter compositor; DMS_RUN_GREETER)
+   /usr/share/wayland-sessions/niri.desktop  (Exec=niri-session)
 
  Notes
    Do not add spawn-at-startup "waybar" — DMS is the shell.
