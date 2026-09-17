@@ -44,23 +44,22 @@
 #   DMS compositor setup:  https://danklinux.com/docs/dankmaterialshell/compositors
 #   niri config includes:  https://niri-wm.github.io/niri/Configuration:-Include.html
 #
-# Notes on this revision (rev3 = rev1 + rev2 + review follow-ups)
-#   - Config includes require niri >= 25.11; the script detects this and falls
-#     back to a standalone config on older niri.
-#   - All includes are written as `include optional=true` so a missing DMS
-#     fragment cannot stop niri from loading at login.
-#   - DMS-specific binds are written inline ONLY when dms/binds.kdl is absent,
-#     because niri treats a duplicate keybind as a parsing failure.
-#   - getty@tty1 is disabled but never stopped, so running this from tty1 does
-#     not kill the shell running it.
-#   - DMS is started once, via `systemctl --user add-wants niri.service dms`.
-#   - `dms setup` is headless only (stdin closed). No interactive TUI fallback,
-#     so an unattended first-boot run cannot hang on a prompt.
-#   - Bind scraping warns on unparsed lines in dms/binds.kdl instead of
-#     silently omitting them (those would later fail `niri validate`).
-#   - No blueman / nm-applet / polkit-gnome. DMS owns network, bluetooth,
-#     and the polkit agent. `sudo dnf install blueman` later if you want
-#     the standalone manager.
+# Notes on this revision (rev4)
+#   - greetd starts `dms-greeter --command niri-session -C /etc/greetd/niri.kdl`.
+#     Raw `niri` skips systemd/D-Bus import: black greeter and inactive niri.service.
+#   - After `dms-greeter enable`, the script re-reads config.toml and rewrites
+#     it if the command is not niri-session. A failed --command flag must not
+#     silently fall back to `--command niri`.
+#   - Greeter host config is /etc/greetd/niri.kdl (DMS_RUN_GREETER=1).
+#   - Config includes require niri >= 25.11; older niri gets a standalone file.
+#   - Includes use `optional=true`. Duplicate binds are stripped when
+#     dms/binds.kdl already owns the key. niri validate runs before reboot.
+#   - getty@tty1 is disabled but never stopped (script often runs on tty1).
+#   - DMS is started once: `systemctl --user add-wants niri.service dms`.
+#   - `dms setup` is headless only (stdin closed). No interactive TUI fallback.
+#   - No defaultyes=True in dnf.conf (script already passes -y).
+#   - cups + cups-pk-helper for the DMS printer panel. No blueman / nm-applet /
+#     polkit-gnome; DMS owns those UIs.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -155,20 +154,12 @@ dnf_install_available() {
 dnf_bootstrap() {
     log "Tuning DNF and upgrading the minimal base"
 
-    # max_parallel_downloads: safe, only affects download concurrency.
+    # max_parallel_downloads only. Do not set defaultyes=True: this script
+    # already passes -y, and defaultyes would confirm future interactive
+    # `dnf remove` / `dnf autoremove` with a bare Enter.
     if [[ -f /etc/dnf/dnf.conf ]] && ! grep -q '^max_parallel_downloads=' /etc/dnf/dnf.conf; then
         printf 'max_parallel_downloads=10\n' | sudo tee -a /etc/dnf/dnf.conf >/dev/null
         ok "Set DNF max_parallel_downloads=10"
-    fi
-
-    # defaultyes=True: changes the default answer for every FUTURE interactive
-    # dnf prompt on this machine, not just this script (which already passes
-    # -y everywhere and never prompts). Mainly a risk on `dnf remove` /
-    # `dnf autoremove`, where hitting Enter without reading now confirms
-    # removing whatever dependency chain dnf listed. Included on request.
-    if [[ -f /etc/dnf/dnf.conf ]] && ! grep -q '^defaultyes=' /etc/dnf/dnf.conf; then
-        printf 'defaultyes=True\n' | sudo tee -a /etc/dnf/dnf.conf >/dev/null
-        ok "Set DNF defaultyes=True"
     fi
 
     sudo dnf upgrade --refresh -y
@@ -289,8 +280,8 @@ install_packages() {
 
         # `dms doctor` optional-feature packages. None of these are required —
         # dms runs fine without them — they just light up specific panels.
-        cups-pk-helper          # Printer management panel (needs a running
-                                 # cupsd too; add `cups` here if you want that)
+        cups                    # cupsd; required for the printer panel
+        cups-pk-helper          # polkit helper the DMS printer panel talks to
         qt6-qtimageformats      # WebP/TIFF/GIF/JP2/ICNS previews
         kf6-kimageformats       # AVIF/HEIF/JXL/EXR previews
         i2c-tools               # External monitor brightness via DDC/CI.
@@ -399,6 +390,11 @@ configure_system() {
         sudo systemctl enable --now power-profiles-daemon.service || true
     fi
 
+    if rpm -q cups >/dev/null 2>&1; then
+        sudo systemctl enable --now cups.service || true
+        ok "CUPS enabled"
+    fi
+
     sudo systemctl set-default graphical.target
     ok "Default target is graphical.target"
 
@@ -410,23 +406,22 @@ configure_system() {
         fi
     done
 
+    write_greetd_niri_kdl
+
     if command -v dms-greeter >/dev/null 2>&1; then
         # Official helper writes /etc/greetd/config.toml, disables other DMs,
-        # and enables greetd. --command must be niri-session (not niri): the
-        # raw binary skips the systemd/D-Bus environment import, so niri
-        # visibly runs but never registers as niri.service — the unit
-        # `systemctl --user add-wants niri.service dms` and dms doctor's
-        # "Active" check both depend on.
+        # and enables greetd. Then pin_greetd_command() re-reads that file and
+        # forces niri-session + -C /etc/greetd/niri.kdl. Bare `dms-greeter
+        # enable` often writes `--command niri`, which skips systemd import
+        # and is the black-greeter / inactive niri.service path.
         if sudo dms-greeter enable --command niri-session >/dev/null 2>&1 \
             || sudo dms-greeter enable >/dev/null 2>&1; then
-            ok "dms-greeter enabled (greetd -> niri-session)"
+            ok "dms-greeter enable ran"
         else
             warn "dms-greeter enable failed; writing greetd config by hand"
-            configure_greetd_manual
         fi
-    else
-        configure_greetd_manual
     fi
+    pin_greetd_command
 
     sudo systemctl enable greetd.service
     ok "greetd enabled"
@@ -460,24 +455,64 @@ configure_system() {
     ok "systemctl --user add-wants niri.service dms"
 }
 
-configure_greetd_manual() {
-    # --command must be niri-session, not niri. The raw binary skips systemd
-    # and D-Bus environment import entirely, so niri visibly runs as your
-    # compositor but never registers as niri.service — which is what
-    # `systemctl --user add-wants niri.service dms` depends on, and almost
-    # certainly what `dms doctor`'s "Active" check queries. Symptom: desktop
-    # works fine, dms doctor still says niri is not active.
-    write_file /tmp/greetd-config.toml <<'EOF'
+write_greetd_niri_kdl() {
+    # Minimal compositor config for the greeter seat (user "greeter"),
+    # not the logged-in session. DMS_RUN_GREETER tells Quickshell to
+    # draw the login UI instead of the desktop shell.
+    sudo mkdir -p /etc/greetd
+    write_file /tmp/greetd-niri.kdl <<'EOF'
+hotkey-overlay {
+    skip-at-startup
+}
+
+environment {
+    DMS_RUN_GREETER "1"
+}
+
+gestures {
+    hot-corners {
+        off
+    }
+}
+
+layout {
+    background-color "#000000"
+}
+EOF
+    sudo install -m 0644 /tmp/greetd-niri.kdl /etc/greetd/niri.kdl
+    rm -f /tmp/greetd-niri.kdl
+    ok "Wrote /etc/greetd/niri.kdl (greeter compositor config)"
+}
+
+pin_greetd_command() {
+    # Always write the known-good greetd command. dms-greeter enable may
+    # have just set `--command niri` (no session wrapper, no -C). That is
+    # the black VT1 failure mode this revision exists to prevent.
+    local cmd='dms-greeter --command niri-session -C /etc/greetd/niri.kdl'
+    local current=""
+    if [[ -f /etc/greetd/config.toml ]]; then
+        current=$(grep -E '^[[:space:]]*command[[:space:]]*=' /etc/greetd/config.toml | tail -n1 || true)
+    fi
+    if printf '%s\n' "${current}" | grep -q 'niri-session' \
+        && printf '%s\n' "${current}" | grep -q '/etc/greetd/niri.kdl'; then
+        ok "greetd command already pinned: ${cmd}"
+        return 0
+    fi
+    if [[ -n ${current} ]]; then
+        warn "greetd command was: ${current}"
+        warn "Rewriting to niri-session + /etc/greetd/niri.kdl"
+    fi
+    write_file /tmp/greetd-config.toml <<EOF
 [terminal]
 vt = 1
 
 [default_session]
 user = "greeter"
-command = "dms-greeter --command niri-session"
+command = "${cmd}"
 EOF
     sudo install -m 0644 /tmp/greetd-config.toml /etc/greetd/config.toml
     rm -f /tmp/greetd-config.toml
-    ok "Wrote /etc/greetd/config.toml (dms-greeter --command niri-session)"
+    ok "Wrote /etc/greetd/config.toml (${cmd})"
 }
 
 # ---------------------------------------------------------------------------
@@ -1213,7 +1248,8 @@ print_summary() {
  Files
    ~/.config/niri/config.kdl
    ~/.config/niri/dms/*.kdl     (from \`dms setup\`)
-   /etc/greetd/config.toml
+   /etc/greetd/config.toml      (dms-greeter --command niri-session)
+   /etc/greetd/niri.kdl         (greeter compositor; DMS_RUN_GREETER)
 
  Notes
    Do not add spawn-at-startup "waybar" — DMS is the shell.
