@@ -155,11 +155,20 @@ dnf_install_available() {
 dnf_bootstrap() {
     log "Tuning DNF and upgrading the minimal base"
 
-    # Only max_parallel_downloads. Deliberately NOT defaultyes=True: that would
-    # change the default answer for every future interactive dnf on this box.
+    # max_parallel_downloads: safe, only affects download concurrency.
     if [[ -f /etc/dnf/dnf.conf ]] && ! grep -q '^max_parallel_downloads=' /etc/dnf/dnf.conf; then
         printf 'max_parallel_downloads=10\n' | sudo tee -a /etc/dnf/dnf.conf >/dev/null
         ok "Set DNF max_parallel_downloads=10"
+    fi
+
+    # defaultyes=True: changes the default answer for every FUTURE interactive
+    # dnf prompt on this machine, not just this script (which already passes
+    # -y everywhere and never prompts). Mainly a risk on `dnf remove` /
+    # `dnf autoremove`, where hitting Enter without reading now confirms
+    # removing whatever dependency chain dnf listed. Included on request.
+    if [[ -f /etc/dnf/dnf.conf ]] && ! grep -q '^defaultyes=' /etc/dnf/dnf.conf; then
+        printf 'defaultyes=True\n' | sudo tee -a /etc/dnf/dnf.conf >/dev/null
+        ok "Set DNF defaultyes=True"
     fi
 
     sudo dnf upgrade --refresh -y
@@ -278,6 +287,18 @@ install_packages() {
         power-profiles-daemon
         linux-firmware
 
+        # `dms doctor` optional-feature packages. None of these are required —
+        # dms runs fine without them — they just light up specific panels.
+        cups-pk-helper          # Printer management panel (needs a running
+                                 # cupsd too; add `cups` here if you want that)
+        qt6-qtimageformats      # WebP/TIFF/GIF/JP2/ICNS previews
+        kf6-kimageformats       # AVIF/HEIF/JXL/EXR previews
+        i2c-tools               # External monitor brightness via DDC/CI.
+                                 # Also needs the user in the `i2c` group and
+                                 # the i2c-dev kernel module — handled in
+                                 # configure_system(), not by this package alone.
+        khal                    # CalDAV/local calendar events in the dash calendar
+
         # small utilities
         git
         jq
@@ -337,6 +358,24 @@ configure_system() {
     sudo usermod -aG video,audio,input,wheel "${USER}" || true
     ok "Ensured ${USER} is in video,audio,input,wheel"
 
+    # DDC/CI external-monitor brightness control (dms doctor: "I2C/DDC").
+    # i2c-tools alone is not enough: the i2c-dev module has to be loaded so
+    # /dev/i2c-* exists, and the user has to be in the i2c group to read/write
+    # those nodes without root. All three steps are optional — dms works
+    # without them, you just lose external-monitor brightness sliders.
+    if command -v i2cdetect >/dev/null 2>&1; then
+        sudo modprobe i2c-dev 2>/dev/null || true
+        if ! lsmod | grep -q '^i2c_dev'; then
+            warn "i2c-dev did not load (no I2C-capable GPU/adapter on this machine?)"
+        fi
+        printf 'i2c-dev\n' | sudo tee /etc/modules-load.d/i2c-dev.conf >/dev/null
+        sudo groupadd -f i2c
+        sudo usermod -aG i2c "${USER}" || true
+        ok "i2c-dev set to load at boot; ${USER} added to the i2c group"
+        warn "New group membership needs a fresh login (or reboot) to take effect"
+    fi
+
+
     if systemctl is-enabled NetworkManager.service >/dev/null 2>&1 \
         || rpm -q NetworkManager >/dev/null 2>&1; then
         if systemctl is-enabled systemd-networkd.service >/dev/null 2>&1; then
@@ -373,10 +412,14 @@ configure_system() {
 
     if command -v dms-greeter >/dev/null 2>&1; then
         # Official helper writes /etc/greetd/config.toml, disables other DMs,
-        # and enables greetd. Compositor is niri.
-        if sudo dms-greeter enable --command niri >/dev/null 2>&1 \
+        # and enables greetd. --command must be niri-session (not niri): the
+        # raw binary skips the systemd/D-Bus environment import, so niri
+        # visibly runs but never registers as niri.service — the unit
+        # `systemctl --user add-wants niri.service dms` and dms doctor's
+        # "Active" check both depend on.
+        if sudo dms-greeter enable --command niri-session >/dev/null 2>&1 \
             || sudo dms-greeter enable >/dev/null 2>&1; then
-            ok "dms-greeter enabled (greetd -> niri)"
+            ok "dms-greeter enabled (greetd -> niri-session)"
         else
             warn "dms-greeter enable failed; writing greetd config by hand"
             configure_greetd_manual
@@ -418,17 +461,23 @@ configure_system() {
 }
 
 configure_greetd_manual() {
+    # --command must be niri-session, not niri. The raw binary skips systemd
+    # and D-Bus environment import entirely, so niri visibly runs as your
+    # compositor but never registers as niri.service — which is what
+    # `systemctl --user add-wants niri.service dms` depends on, and almost
+    # certainly what `dms doctor`'s "Active" check queries. Symptom: desktop
+    # works fine, dms doctor still says niri is not active.
     write_file /tmp/greetd-config.toml <<'EOF'
 [terminal]
 vt = 1
 
 [default_session]
 user = "greeter"
-command = "dms-greeter --command niri"
+command = "dms-greeter --command niri-session"
 EOF
     sudo install -m 0644 /tmp/greetd-config.toml /etc/greetd/config.toml
     rm -f /tmp/greetd-config.toml
-    ok "Wrote /etc/greetd/config.toml (dms-greeter --command niri)"
+    ok "Wrote /etc/greetd/config.toml (dms-greeter --command niri-session)"
 }
 
 # ---------------------------------------------------------------------------
@@ -751,7 +800,10 @@ window-rule {
 window-rule {
     match app-id=r#"^org\.wezfurlong\.wezterm$"#
     match app-id="Alacritty"
-    default-column-width {}
+    // NOT default-column-width {} — an empty block means "let the window pick
+    // its own width," which fights layout's default-column-width proportion
+    // 0.5 above, so terminals stopped splitting evenly with everything else.
+    // Terminals use the same 50% default as any other window.
     draw-border-with-background false
 }
 
@@ -1040,12 +1092,18 @@ EOF
 
     write_file "${HOME}/.config/alacritty/alacritty.toml" <<'EOF'
 [window]
-padding = { x = 10, y = 8 }
+# Padding trimmed and font a point smaller than the original 10px/12.0pt:
+# at the default niri tiled column width, that combination landed a couple
+# columns under 80, which trips the minimum-terminal-size check some CLI
+# tools (including `dms doctor`/`dms setup`) enforce. If you still see a
+# "Terminal size too small" message on your monitor, either drop `size`
+# further, cycle to a wider column with Mod+R, or fullscreen with Mod+F.
+padding = { x = 6, y = 6 }
 decorations = "None"
 opacity = 0.96
 
 [font]
-size = 12.0
+size = 11.0
 
 [font.normal]
 family = "JetBrains Mono"
